@@ -39,9 +39,9 @@ class Settings(BaseSettings):
     llm_api_base: str = "http://ai-gateway.wps.cn/api/v3"
     llm_api_key: str = ""
     llm_model: str = "deepseek/deepseek-v4-flash"
-    llm_gateway_uid: str = "9018"
-    llm_gateway_product: str = "wps_aigctest_hpcllmtest"
-    llm_gateway_intention: str = "wps_aigctest_hpcllmtest_formulage"
+    llm_gateway_uid: str = ""
+    llm_gateway_product: str = ""
+    llm_gateway_intention: str = ""
 
     # Redis
     redis_url: str = "redis://localhost:6379/0"
