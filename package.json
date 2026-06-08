@@ -1,0 +1,57 @@
+{
+  "name": "offergraph",
+  "version": "0.1.0",
+  "description": "面经雷达 - 实时搜索全网面经并推送结构化内容",
+  "main": "electron/main.cjs",
+  "scripts": {
+    "dev": "concurrently -k \"npm:dev:backend\" \"npm:dev:web\" \"npm:dev:electron\"",
+    "dev:backend": "cd backend && uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload",
+    "dev:web": "cd frontend && next dev -p 3000",
+    "dev:electron": "wait-on http://127.0.0.1:8000/health && wait-on http://localhost:3000 && electron .",
+    "build": "cd frontend && next build",
+    "pack": "npm run build && electron-builder --dir",
+    "dist": "npm run build && electron-builder"
+  },
+  "build": {
+    "appId": "app.offergraph.desktop",
+    "productName": "OfferGraph",
+    "asar": false,
+    "directories": {
+      "output": "release",
+      "buildResources": "build"
+    },
+    "files": [
+      "electron/**/*",
+      "frontend/.next/**/*",
+      "frontend/public/**/*",
+      "frontend/package.json",
+      "frontend/next.config.ts",
+      "frontend/node_modules/**/*",
+      "backend/**/*",
+      "!backend/__pycache__/**",
+      "!backend/**/*.pyc",
+      "!backend/tests/**",
+      "package.json"
+    ],
+    "extraResources": [
+      { "from": "vendor/python", "to": "python", "filter": ["**/*"] }
+    ],
+    "win": {
+      "target": [{ "target": "nsis", "arch": ["x64"] }],
+      "icon": "build/icon.ico",
+      "signAndEditExecutable": false
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true
+    }
+  },
+  "devDependencies": {
+    "concurrently": "^9.0.0",
+    "electron": "^33.0.0",
+    "electron-builder": "^25.0.0",
+    "wait-on": "^8.0.0"
+  }
+}

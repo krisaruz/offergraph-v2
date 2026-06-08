@@ -1,0 +1,44 @@
+---
+description: 前端实现与视觉设计规范
+globs: "**/*.{tsx,jsx,ts,js,css,scss,vue}"
+alwaysApply: false
+---
+
+涉及前端页面、组件、布局、样式、交互时，必须遵守 `AGENTS.md` 中的前端视觉设计规则。
+
+本项目不接受默认 AI 风格前端。
+
+必须先确定视觉方向，再实现。
+
+优先方向：
+
+- Research Console
+- Radar Intelligence
+- Editorial Data Product
+
+禁止：
+
+- 大面积紫色渐变
+- 无意义 glassmorphism
+- 过度圆角卡片
+- 大量 shadow-xl
+- 所有内容都卡片化
+- 默认 AI SaaS 风
+- 无信息层级的 dashboard
+
+实现前说明：
+
+1. 视觉方向
+2. 信息层级
+3. 主要组件结构
+4. 色彩策略
+5. 排版策略
+
+实现后检查：
+
+1. loading / empty / error / success / failed request
+2. 重复提交
+3. 响应式
+4. 基础可访问性
+5. 是否像廉价模板
+6. 是否需要 visual-reviewer 审查
