@@ -122,16 +122,41 @@ offergraph-v2/
 | Electron 桌面打包 | ✅ |
 | 单元测试覆盖 | ✅ (65 tests) |
 
-## LLM 配置
+## 环境变量配置
 
-使用公司 AI Gateway（WPS）：
+**所有密钥必须通过 `.env` 文件配置，禁止硬编码在代码中。**
 
-```env
-LLM_API_BASE=http://ai-gateway.wps.cn/api/v3
-LLM_MODEL=deepseek/deepseek-v4-flash
+### 后端配置
+
+```bash
+cd backend
+cp .env.example .env
+# 编辑 .env 填入实际值
 ```
 
-支持模型：deepseek-v4-flash, deepseek-v4-pro, claude-opus-4-6, gpt-5.5, gemini-3.5-flash 等。
+| 变量 | 必填 | 说明 |
+|------|------|------|
+| `LLM_API_BASE` | ✅ | LLM API 地址 |
+| `LLM_API_KEY` | ✅ | LLM API 密钥 |
+| `LLM_MODEL` | ✅ | 模型名称 |
+| `LLM_GATEWAY_UID` | ✅ | AI Gateway UID |
+| `LLM_GATEWAY_PRODUCT` | ✅ | AI Gateway 产品标识 |
+| `LLM_GATEWAY_INTENTION` | ✅ | AI Gateway 意图标识 |
+| `SEARCH_API_KEY` | ❌ | SerpAPI 密钥（搜索引擎） |
+| `XHS_COOKIE` | ❌ | 小红书 Cookie |
+| `MAIMAI_COOKIE` | ❌ | 脉脉 Cookie |
+
+### 前端配置
+
+```bash
+cd frontend
+cp .env.local.example .env.local
+# 编辑 .env.local 填入实际值
+```
+
+| 变量 | 说明 |
+|------|------|
+| `NEXT_PUBLIC_API_URL` | 后端 API 地址（默认 `http://127.0.0.1:8000`） |
 
 ## API 端点
 

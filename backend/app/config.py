@@ -36,7 +36,7 @@ class Settings(BaseSettings):
     feed_cache_max_age_days: int = 30
 
     # LLM
-    llm_api_base: str = "http://ai-gateway.wps.cn/api/v3"
+    llm_api_base: str = ""
     llm_api_key: str = ""
     llm_model: str = "deepseek/deepseek-v4-flash"
     llm_gateway_uid: str = ""

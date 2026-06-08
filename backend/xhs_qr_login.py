@@ -88,7 +88,6 @@ def main():
 
                 print(f"\n登录成功! User ID: {user_id}", flush=True)
                 print(f"Cookie saved to xhs_cookies.json", flush=True)
-                print(f"Cookie string:\n{cookie_str}", flush=True)
                 return
 
             if elapsed % 15 == 0 and elapsed > 0:
