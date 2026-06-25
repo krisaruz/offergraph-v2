@@ -1,9 +1,13 @@
 # Environment files
 .env
-.env.local
-.env.*.local
+.env.*
 !.env.example
 !.env.local.example
+
+# Auth & state files
+playwright/.auth
+storage_state.json
+cookies.json
 
 # Python
 __pycache__/
@@ -15,7 +19,11 @@ build/
 .venv/
 venv/
 *.db
+*.db-shm
+*.db-wal
+*.sqlite
 *.sqlite3
+*.bak
 
 # Node
 node_modules/
@@ -39,6 +47,22 @@ Thumbs.db
 
 # Logs
 *.log
+runtime/
+backend/runtime/
 
 # Claude
 .claude/
+
+# Codex local hooks
+.codex/
+.codex/hooks.json
+
+# Cursor local rules (private)
+.cursor/
+
+# Agents local config
+.agents/
+
+# AI guard markers (local only, diff-hash bound)
+.ai-review-ok
+.e2e-ok
