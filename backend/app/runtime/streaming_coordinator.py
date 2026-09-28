@@ -20,6 +20,7 @@ SSE 事件流：
 import asyncio
 import json
 import logging
+import re
 import time
 import uuid
 from datetime import datetime
@@ -28,7 +29,7 @@ from typing import Any, AsyncGenerator, Dict, List, Optional
 from sqlalchemy import select as sa_select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.adapters.base import SourceAdapter, SourceQuery
+from app.adapters.base import SourceAdapter, SourceQuery, SourceSearchItem, SourceSearchResult, SourceStatus
 from app.config import settings
 from app.database import async_session_factory
 from app.models.source_document import SourceDocumentModel
@@ -37,6 +38,7 @@ from app.runtime.permission_guard import PermissionGuard
 from app.runtime.query_planner import QueryPlanner
 from app.runtime.ranker import Ranker
 from app.runtime.session_manager import SessionManager
+from app.runtime.source_health import SourceHealthRegistry
 from app.runtime.tool_registry import ToolRegistry
 from app.runtime.trace_logger import TraceLogger
 
@@ -67,6 +69,7 @@ class StreamingCoordinator:
         tool_registry: Optional[ToolRegistry] = None,
         permission_guard: Optional[PermissionGuard] = None,
         hook_engine: Optional[HookEngine] = None,
+        source_health_registry: Optional[SourceHealthRegistry] = None,
     ):
         self._db = db
         self._adapters = adapters
@@ -77,6 +80,7 @@ class StreamingCoordinator:
         self._session_manager = SessionManager(db)
         self._trace = TraceLogger(db)
         self._ranker = Ranker()
+        self._source_health = source_health_registry or SourceHealthRegistry()
 
     async def run_stream(self, profile: dict) -> AsyncGenerator[str, None]:
         """
@@ -199,13 +203,7 @@ class StreamingCoordinator:
                 "message": f"搜索完成，正在对 {len(all_results)} 条结果去重排序...",
             })
 
-            seen_urls = set()
-            deduped_results = []
-            for item in all_results:
-                url = item.get("source_url", "")
-                if url and url not in seen_urls:
-                    seen_urls.add(url)
-                    deduped_results.append(item)
+            deduped_results = self._dedupe_and_filter_results(all_results, query_plan)
 
             url_counts: Dict[str, int] = {}
             for item in all_results:
@@ -463,7 +461,20 @@ class StreamingCoordinator:
                 if isinstance(qr, Exception):
                     logger.warning(f"Query failed for {adapter_id}: {qr}")
                     continue
-                for sr in qr:
+                if isinstance(qr, SourceSearchResult):
+                    if qr.status not in {SourceStatus.OK, SourceStatus.EMPTY}:
+                        self._source_health.record_status(adapter_id, qr.status, qr.reason)
+                        continue
+                    search_items = qr.normalized_items()
+                else:
+                    search_items = []
+                    for entry in qr:
+                        if isinstance(entry, SourceSearchItem):
+                            search_items.append(entry)
+                        elif isinstance(entry, SourceSearchResult):
+                            search_items.extend(entry.normalized_items())
+
+                for sr in search_items:
                     item = {
                         "source": sr.source,
                         "source_url": sr.source_url,
@@ -473,9 +484,14 @@ class StreamingCoordinator:
                     }
                     all_results.append(item)
 
+            display_results = self._ranker.rank(
+                self._dedupe_and_filter_results(all_results, query_plan),
+                profile={},
+            )
+
             push("source_results", {
                 "source": adapter_id,
-                "items": all_results,
+                "items": display_results,
             })
 
             ended_at = datetime.utcnow()
@@ -656,7 +672,26 @@ class StreamingCoordinator:
                 result = await extract_db.execute(stmt)
                 source_doc = result.scalar_one_or_none()
                 if not source_doc:
-                    push("extract_completed", {"source_document_id": doc_id, "error": "doc not found"})
+                    push("extract_completed", {
+                        "source_document_id": doc_id,
+                        "error": "doc not found",
+                        "status": "failed",
+                        "extraction_status": "failed",
+                        "question_count": 0,
+                        "representative_questions": [],
+                    })
+                    return
+
+                if source_doc.source == "official_job":
+                    source_doc.extraction_status = "skipped"
+                    await extract_db.commit()
+                    push("extract_completed", {
+                        "source_document_id": doc_id,
+                        "status": "skipped",
+                        "extraction_status": "skipped",
+                        "question_count": 0,
+                        "representative_questions": [],
+                    })
                     return
 
                 doc_title = source_doc.title or source_doc.source_url[:40]
@@ -716,6 +751,7 @@ class StreamingCoordinator:
                     "status": extract_result.get("status", "unknown"),
                     "evidence_coverage": extract_result.get("evidence_coverage", 0.0),
                     "tags": extract_result.get("tags", []),
+                    "representative_questions": extract_result.get("representative_questions", []),
                 })
 
                 ended_at = datetime.utcnow()
@@ -746,6 +782,9 @@ class StreamingCoordinator:
                 "source_document_id": doc_id,
                 "error": f"timeout ({EXTRACT_TIMEOUT_S}s)",
                 "status": "timeout",
+                "extraction_status": "timeout",
+                "question_count": 0,
+                "representative_questions": [],
             })
             push("activity_log", {
                 "message": "文章分析超时，已跳过",
@@ -754,6 +793,16 @@ class StreamingCoordinator:
 
         except Exception as e:
             logger.warning(f"Extraction failed for doc {doc_id}: {e}")
+            try:
+                async with async_session_factory() as failed_db:
+                    stmt = sa_select(SourceDocumentModel).where(SourceDocumentModel.id == doc_id)
+                    result = await failed_db.execute(stmt)
+                    failed_doc = result.scalar_one_or_none()
+                    if failed_doc:
+                        failed_doc.extraction_status = "failed"
+                    await failed_db.commit()
+            except Exception as status_exc:
+                logger.warning("Failed to mark extraction failed for doc %s: %s", doc_id, status_exc)
             push("llm_summary", {
                 "doc_id": doc_id,
                 "summary": f"分析失败: {str(e)[:50]}",
@@ -762,7 +811,69 @@ class StreamingCoordinator:
             push("extract_completed", {
                 "source_document_id": doc_id,
                 "error": str(e)[:100],
+                "status": "failed",
+                "extraction_status": "failed",
+                "question_count": 0,
+                "representative_questions": [],
             })
+
+    def _dedupe_and_filter_results(self, items: list[dict[str, Any]], query_plan) -> list[dict[str, Any]]:
+        seen_urls: set[str] = set()
+        filtered: list[dict[str, Any]] = []
+        target_companies = [q.company for q in query_plan.queries if q.company]
+        target_positions = [q.position for q in query_plan.queries if q.position]
+
+        for item in items:
+            url = item.get("source_url", "")
+            if not url or url in seen_urls:
+                continue
+            seen_urls.add(url)
+            if not self._is_display_candidate(item, target_companies, target_positions):
+                continue
+            filtered.append(item)
+        return filtered
+
+    @staticmethod
+    def _is_display_candidate(
+        item: dict[str, Any],
+        target_companies: list[str],
+        target_positions: list[str],
+    ) -> bool:
+        if item.get("source") == "official_job":
+            return True
+
+        text = f"{item.get('title', '')} {item.get('snippet', '')}".lower()
+        compact_text = re.sub(r"\s+", "", text)
+        if item.get("source") == "search_engine" and not StreamingCoordinator._looks_like_interview(text):
+            return False
+
+        if target_companies and not any(company.lower() in text for company in target_companies):
+            return False
+
+        if target_positions:
+            position_terms = StreamingCoordinator._position_terms(target_positions)
+            if position_terms and not any(term in text or term in compact_text for term in position_terms):
+                return False
+
+        return True
+
+    @staticmethod
+    def _looks_like_interview(text: str) -> bool:
+        return bool(re.search(r"(面经|面试|一面|二面|三面|笔试|追问|手撕|八股|项目)", text, re.IGNORECASE))
+
+    @staticmethod
+    def _position_terms(positions: list[str]) -> list[str]:
+        terms: list[str] = []
+        for position in positions:
+            compact = re.sub(r"\s+", "", position.lower())
+            if not compact:
+                continue
+            terms.append(compact)
+            for suffix in ("开发", "工程师", "方向", "岗位"):
+                compact = compact.replace(suffix, "")
+            if len(compact) >= 2:
+                terms.append(compact)
+        return list(dict.fromkeys(terms))
 
     def _active_source_ids(self) -> List[str]:
         """返回当前启用的 source adapter 列表"""

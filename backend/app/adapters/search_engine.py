@@ -8,7 +8,15 @@ from typing import List, Optional
 
 import httpx
 
-from app.adapters.base import SourceAdapter, SourceDocument, SourceQuery, SourceSearchResult
+from app.adapters.base import (
+    SourceAdapter,
+    SourceDocument,
+    SourceQuery,
+    SourceSearchItem,
+    SourceSearchResult,
+    SourceStatus,
+)
+from app.adapters.free_web_search import search_bing_rss
 from app.config import settings
 from app.utils.text_clean import clean_html, content_hash, normalize_text
 
@@ -37,58 +45,105 @@ class SearchEngineAdapter(SourceAdapter):
             "supportsDateFilter": True,
         }
 
-    async def search(self, query: SourceQuery) -> List[SourceSearchResult]:
-        if not settings.search_api_key:
-            logger.info("SearchEngine: no API key configured, skipping")
-            return []
+    async def search(self, query: SourceQuery) -> SourceSearchResult:
+        if not settings.searxng_base_url:
+            outcome = await search_bing_rss(
+                query.query,
+                limit=query.limit,
+                timeout_s=settings.search_timeout_search_engine,
+                language=settings.searxng_language,
+            )
+            return SourceSearchResult(
+                source="search_engine",
+                status=outcome.status,
+                items=[self._item_from_web_result(item) for item in outcome.results[: query.limit]],
+                count=len(outcome.results[: query.limit]),
+                reason=(
+                    "SEARXNG_BASE_URL missing; used free Bing RSS fallback"
+                    if outcome.status == SourceStatus.OK
+                    else outcome.reason
+                ),
+            )
 
-        results: List[SourceSearchResult] = []
+        provider_was_explicit = "search_api_provider" in settings.model_fields_set
+        if provider_was_explicit and settings.search_api_provider != "searxng":
+            return SourceSearchResult(
+                source="search_engine",
+                status=SourceStatus.CONFIG_ERROR,
+                items=[],
+                count=0,
+                reason="Only free self-hosted SearXNG is supported",
+            )
+
         timeout = httpx.Timeout(settings.search_timeout_search_engine)
-
-        search_query = query.query
-        # SerpAPI Google Search
         params = {
-            "q": search_query,
-            "api_key": settings.search_api_key,
-            "engine": "google",
-            "num": query.limit,
-            "hl": "zh-CN",
-            "gl": "cn",
+            "q": query.query,
+            "format": "json",
+            "language": settings.searxng_language,
+            "safesearch": settings.searxng_safe_search,
+            "pageno": 1,
         }
 
         try:
             async with httpx.AsyncClient(timeout=timeout) as client:
-                resp = await client.get("https://serpapi.com/search", params=params)
-                if resp.status_code != 200:
-                    logger.warning(f"SerpAPI failed: status={resp.status_code}")
-                    return []
-
-                data = resp.json()
-                organic = data.get("organic_results", [])
-
-                for item in organic:
-                    link = item.get("link", "")
-                    title = item.get("title", "")
-                    snippet = item.get("snippet", "")
-
-                    if not link:
-                        continue
-
-                    results.append(SourceSearchResult(
+                resp = await client.get(settings.searxng_base_url.rstrip("/") + "/search", params=params)
+                if resp.status_code == 403:
+                    return SourceSearchResult(
                         source="search_engine",
-                        source_url=link,
-                        title=title,
-                        snippet=snippet,
-                        published_at=item.get("date"),
-                        raw=item,
-                    ))
+                        status=SourceStatus.CONFIG_ERROR,
+                        count=0,
+                        reason="SearXNG JSON format is disabled or forbidden",
+                    )
+                if resp.status_code == 429:
+                    return SourceSearchResult(
+                        source="search_engine",
+                        status=SourceStatus.RATE_LIMITED,
+                        count=0,
+                        reason="Rate limited by SearXNG",
+                    )
+                if resp.status_code != 200:
+                    return SourceSearchResult(
+                        source="search_engine",
+                        status=SourceStatus.ERROR,
+                        count=0,
+                        reason=f"HTTP Error {resp.status_code}",
+                    )
+                data = resp.json()
+                items = [
+                    self._item_from_web_result(item)
+                    for item in (data.get("results") or [])[: query.limit]
+                    if item.get("url") or item.get("link")
+                ]
+                return SourceSearchResult(
+                    source="search_engine",
+                    status=SourceStatus.OK if items else SourceStatus.EMPTY,
+                    items=items,
+                    count=len(items),
+                )
 
         except httpx.TimeoutException:
             logger.warning("SearchEngine search timeout")
+            return SourceSearchResult(
+                source="search_engine",
+                status=SourceStatus.TIMEOUT,
+                count=0,
+                reason="Timeout calling SearXNG API",
+            )
+        except ValueError:
+            return SourceSearchResult(
+                source="search_engine",
+                status=SourceStatus.CONFIG_ERROR,
+                count=0,
+                reason="SearXNG did not return JSON; enable search.formats=json",
+            )
         except Exception as e:
             logger.error(f"SearchEngine search error: {e}")
-
-        return results
+            return SourceSearchResult(
+                source="search_engine",
+                status=SourceStatus.ERROR,
+                count=0,
+                reason=str(e),
+            )
 
     async def fetch(self, url: str) -> Optional[SourceDocument]:
         """通用网页抓取，提取正文"""
@@ -127,6 +182,17 @@ class SearchEngineAdapter(SourceAdapter):
         except Exception as e:
             logger.error(f"SearchEngine fetch error: {url} - {e}")
             return None
+
+    @staticmethod
+    def _item_from_web_result(item: dict) -> SourceSearchItem:
+        return SourceSearchItem(
+            source="search_engine",
+            source_url=item.get("url") or item.get("link") or "",
+            title=item.get("title") or item.get("url") or item.get("link") or "",
+            snippet=item.get("content") or item.get("snippet") or "",
+            published_at=item.get("publishedDate") or item.get("date") or item.get("published_at"),
+            raw=item,
+        )
 
     @staticmethod
     def _extract_title(html: str) -> Optional[str]:

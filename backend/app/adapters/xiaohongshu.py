@@ -8,8 +8,20 @@ import asyncio
 import logging
 from typing import List, Optional
 
-from app.adapters.base import SourceAdapter, SourceDocument, SourceQuery, SourceSearchResult
+import httpx
+
+from app.adapters.base import (
+    SourceAdapter,
+    SourceDocument,
+    SourceQuery,
+    SourceSearchItem,
+    SourceSearchResult,
+    SourceStatus,
+)
+from app.adapters.free_web_search import search_bing_rss
 from app.adapters.xhs_mcp_client import XhsMcpClient
+from app.config import settings
+from app.runtime.source_health import GLOBAL_SOURCE_HEALTH
 from app.utils.text_clean import content_hash, normalize_text
 
 logger = logging.getLogger(__name__)
@@ -74,12 +86,12 @@ class XiaohongshuAdapter(SourceAdapter):
             "supportsDateFilter": False,
         }
 
-    async def search(self, query: SourceQuery) -> List[SourceSearchResult]:
+    async def search(self, query: SourceQuery) -> SourceSearchResult:
         """通过 MCP search_notes 工具搜索小红书笔记"""
         client = await self._get_client()
         if not client:
             logger.warning("XHS: MCP client unavailable")
-            return []
+            return await self._fallback_searxng_url_discovery(query)
 
         notes = await client.search_notes(
             keywords=query.query,
@@ -88,7 +100,7 @@ class XiaohongshuAdapter(SourceAdapter):
 
         if not notes:
             logger.info(f"XHS MCP: no results for '{query.query}'")
-            return []
+            return await self._fallback_searxng_url_discovery(query)
 
         results = []
         for note in notes:
@@ -97,7 +109,7 @@ class XiaohongshuAdapter(SourceAdapter):
             if not url:
                 continue
 
-            results.append(SourceSearchResult(
+            results.append(SourceSearchItem(
                 source="xiaohongshu",
                 source_url=url,
                 title=title,
@@ -107,7 +119,95 @@ class XiaohongshuAdapter(SourceAdapter):
             ))
 
         logger.info(f"XHS MCP: found {len(results)} results for '{query.query}'")
-        return results
+        return SourceSearchResult(
+            source="xiaohongshu",
+            status=SourceStatus.OK if results else SourceStatus.EMPTY,
+            items=results,
+            count=len(results),
+        )
+
+    async def _fallback_searxng_url_discovery(self, query: SourceQuery) -> SourceSearchResult:
+        if not settings.searxng_base_url:
+            fallback_query = f"{query.query} 小红书 面经 site:xiaohongshu.com/explore"
+            outcome = await search_bing_rss(
+                fallback_query,
+                limit=query.limit,
+                timeout_s=settings.search_timeout_search_engine,
+                language=settings.searxng_language,
+            )
+            items = self._items_from_public_results(outcome.results, query.limit)
+            return SourceSearchResult(
+                source="xiaohongshu",
+                status=SourceStatus.OK if items else outcome.status,
+                items=items,
+                count=len(items),
+                reason=(
+                    "XHS MCP unavailable; fell back to free web URL discovery"
+                    if items else outcome.reason
+                ),
+            )
+
+        params = {
+            "q": f"{query.query} 小红书 面经 site:xiaohongshu.com/explore",
+            "format": "json",
+        }
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                resp = await client.get(settings.searxng_base_url.rstrip("/") + "/search", params=params)
+            if resp.status_code != 200:
+                return SourceSearchResult(
+                    source="xiaohongshu",
+                    status=SourceStatus.ERROR,
+                    count=0,
+                    reason=f"SearXNG fallback returned HTTP {resp.status_code}",
+                )
+            items = self._items_from_public_results(resp.json().get("results") or [], query.limit)
+            return SourceSearchResult(
+                source="xiaohongshu",
+                status=SourceStatus.OK if items else SourceStatus.EMPTY,
+                items=items[: query.limit],
+                count=len(items[: query.limit]),
+                reason="XHS MCP unavailable; fell back to SearXNG URL discovery",
+            )
+        except httpx.TimeoutException:
+            return SourceSearchResult(
+                source="xiaohongshu",
+                status=SourceStatus.TIMEOUT,
+                count=0,
+                reason="SearXNG fallback timed out",
+            )
+        except Exception as exc:
+            return SourceSearchResult(
+                source="xiaohongshu",
+                status=SourceStatus.ERROR,
+                count=0,
+                reason=str(exc),
+            )
+
+    @staticmethod
+    def _items_from_public_results(results: list[dict], limit: int) -> list[SourceSearchItem]:
+        items: list[SourceSearchItem] = []
+        for row in results:
+            url = str(row.get("url") or row.get("link") or "")
+            if "xiaohongshu.com/explore" not in url:
+                continue
+            title = str(row.get("title") or "小红书笔记")
+            content = str(row.get("content") or row.get("snippet") or "")
+            items.append(SourceSearchItem(
+                source="xiaohongshu",
+                source_url=url,
+                title=title,
+                snippet=content or title,
+                published_at=row.get("publishedDate") or row.get("date"),
+                raw={
+                    **row,
+                    "evidence_status": "url_snippet_only",
+                    "requires_authorized_detail": True,
+                },
+            ))
+            if len(items) >= limit:
+                break
+        return items
 
     async def fetch(self, url: str) -> Optional[SourceDocument]:
         """通过 MCP get_note_content 工具获取笔记全文"""
@@ -115,7 +215,17 @@ class XiaohongshuAdapter(SourceAdapter):
         if not client:
             return None
 
-        note = await client.get_note_content(url)
+        try:
+            note = await client.get_note_content(url)
+        except ValueError as exc:
+            if str(exc) == "auth_required":
+                GLOBAL_SOURCE_HEALTH.record_status(
+                    "xiaohongshu",
+                    SourceStatus.UNAUTHORIZED,
+                    "XHS authorized browser session is required",
+                )
+                return None
+            raise
         if not note:
             logger.info(f"XHS MCP: failed to fetch {url}")
             return None
@@ -144,3 +254,8 @@ class XiaohongshuAdapter(SourceAdapter):
             full_text=normalize_text(full_text),
             content_hash=content_hash(full_text),
         )
+
+    async def _reset_client(self) -> None:
+        if self._client:
+            await self._client.disconnect()
+        self._client = None

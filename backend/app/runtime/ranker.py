@@ -386,7 +386,7 @@ class Ranker:
             else:
                 return 0.05
 
-        return 0.5
+        return 0.3
 
     @staticmethod
     def _date_to_freshness(published_at: str) -> Optional[float]:

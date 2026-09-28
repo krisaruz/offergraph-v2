@@ -7,11 +7,19 @@ import json
 import logging
 import re
 from datetime import datetime
-from typing import List, Optional
+from typing import Optional
 
 import httpx
 
-from app.adapters.base import SourceAdapter, SourceDocument, SourceQuery, SourceSearchResult
+from app.adapters.base import (
+    SourceAdapter,
+    SourceDocument,
+    SourceQuery,
+    SourceSearchItem,
+    SourceSearchResult,
+    SourceStatus,
+)
+from app.adapters.free_web_search import search_bing_rss
 from app.config import settings
 from app.utils.text_clean import clean_html, normalize_text
 
@@ -34,7 +42,15 @@ class NowcoderAdapter(SourceAdapter):
             "supportsDateFilter": False,
         }
 
-    async def search(self, query: SourceQuery) -> List[SourceSearchResult]:
+    async def search(self, query: SourceQuery) -> SourceSearchResult:
+        result = await self._search_api(query, datetime.utcnow())
+        if result.status == SourceStatus.OK and result.items:
+            return result
+        if result.status not in {SourceStatus.OK, SourceStatus.EMPTY}:
+            return result
+        return await self._fallback_public_discovery(query)
+
+    async def _search_api(self, query: SourceQuery, start_time: datetime) -> SourceSearchResult:
         url = f"{GATEWAY_BASE}/pc/search"
         payload = {
             "query": query.query,
@@ -52,7 +68,7 @@ class NowcoderAdapter(SourceAdapter):
             "Origin": "https://www.nowcoder.com",
         }
 
-        results: List[SourceSearchResult] = []
+        results: list[SourceSearchItem] = []
         timeout = httpx.Timeout(settings.search_timeout_platform)
 
         try:
@@ -60,7 +76,12 @@ class NowcoderAdapter(SourceAdapter):
                 resp = await client.post(url, json=payload)
                 if resp.status_code != 200:
                     logger.warning(f"Nowcoder search failed: status={resp.status_code}")
-                    return []
+                    return SourceSearchResult(
+                        source="nowcoder",
+                        status=SourceStatus.ERROR,
+                        count=0,
+                        reason=f"Nowcoder returned HTTP {resp.status_code}",
+                    )
 
                 data = resp.json()
                 inner = data.get("data") or {}
@@ -73,10 +94,85 @@ class NowcoderAdapter(SourceAdapter):
 
         except httpx.TimeoutException:
             logger.warning("Nowcoder search timeout")
+            return SourceSearchResult(
+                source="nowcoder",
+                status=SourceStatus.TIMEOUT,
+                count=0,
+                reason="Nowcoder search timeout",
+            )
         except Exception as e:
             logger.error(f"Nowcoder search error: {e}")
+            return SourceSearchResult(
+                source="nowcoder",
+                status=SourceStatus.ERROR,
+                count=0,
+                reason=str(e),
+            )
 
-        return results
+        return SourceSearchResult(
+            source="nowcoder",
+            status=SourceStatus.OK if results else SourceStatus.EMPTY,
+            items=results,
+            count=len(results),
+            reason=None if results else "No items matched query",
+        )
+
+    async def _fallback_public_discovery(self, query: SourceQuery) -> SourceSearchResult:
+        fallback_query = f"{query.query} 牛客 面经 site:nowcoder.com"
+        if settings.searxng_base_url:
+            try:
+                async with httpx.AsyncClient(timeout=httpx.Timeout(settings.search_timeout_search_engine)) as client:
+                    resp = await client.get(
+                        settings.searxng_base_url.rstrip("/") + "/search",
+                        params={"q": fallback_query, "format": "json"},
+                    )
+                if resp.status_code != 200:
+                    return SourceSearchResult(
+                        source="nowcoder",
+                        status=SourceStatus.ERROR,
+                        count=0,
+                        reason=f"SearXNG fallback returned HTTP {resp.status_code}",
+                    )
+                items = self._items_from_public_results(resp.json().get("results") or [], query.limit)
+                return SourceSearchResult(
+                    source="nowcoder",
+                    status=SourceStatus.OK if items else SourceStatus.EMPTY,
+                    items=items,
+                    count=len(items),
+                    reason="Nowcoder API empty; fell back to SearXNG site search",
+                )
+            except httpx.TimeoutException:
+                return SourceSearchResult(
+                    source="nowcoder",
+                    status=SourceStatus.TIMEOUT,
+                    count=0,
+                    reason="SearXNG fallback timed out",
+                )
+            except Exception as exc:
+                return SourceSearchResult(
+                    source="nowcoder",
+                    status=SourceStatus.ERROR,
+                    count=0,
+                    reason=str(exc),
+                )
+
+        outcome = await search_bing_rss(
+            fallback_query,
+            limit=query.limit,
+            timeout_s=settings.search_timeout_search_engine,
+            language=settings.searxng_language,
+        )
+        items = self._items_from_public_results(outcome.results, query.limit)
+        return SourceSearchResult(
+            source="nowcoder",
+            status=SourceStatus.OK if items else outcome.status,
+            items=items,
+            count=len(items),
+            reason=(
+                "Nowcoder API empty; fell back to free Bing RSS"
+                if items else outcome.reason
+            ),
+        )
 
     async def fetch(self, url: str) -> Optional[SourceDocument]:
         headers = {
@@ -111,7 +207,7 @@ class NowcoderAdapter(SourceAdapter):
             logger.error(f"Nowcoder fetch error: {url} - {e}")
             return None
 
-    def _parse_search_item(self, item: dict) -> Optional[SourceSearchResult]:
+    def _parse_search_item(self, item: dict) -> Optional[SourceSearchItem]:
         moment = item.get("momentData") or {}
         user_brief = item.get("userBrief") or {}
 
@@ -134,7 +230,7 @@ class NowcoderAdapter(SourceAdapter):
         created_at = moment.get("createdAt") or moment.get("createTime")
         published_at = self._format_time(created_at)
 
-        return SourceSearchResult(
+        return SourceSearchItem(
             source="nowcoder",
             source_url=source_url,
             title=title or snippet[:50],
@@ -142,6 +238,25 @@ class NowcoderAdapter(SourceAdapter):
             published_at=published_at,
             raw=item,
         )
+
+    @staticmethod
+    def _items_from_public_results(results: list[dict], limit: int) -> list[SourceSearchItem]:
+        items: list[SourceSearchItem] = []
+        for row in results:
+            url = row.get("url") or row.get("link") or ""
+            if "nowcoder.com" not in url:
+                continue
+            items.append(SourceSearchItem(
+                source="nowcoder",
+                source_url=url,
+                title=row.get("title") or url,
+                snippet=row.get("content") or row.get("snippet") or "",
+                published_at=row.get("publishedDate") or row.get("date") or row.get("published_at"),
+                raw={**row, "evidence_status": "snippet_only"},
+            ))
+            if len(items) >= limit:
+                break
+        return items
 
     @staticmethod
     def _is_uuid(post_id: str) -> bool:

@@ -8,6 +8,9 @@ from fastapi.staticfiles import StaticFiles
 from app.database import init_db
 from app.api.routes_feed import router as feed_router
 from app.api.routes_company_profile import router as company_profile_router
+from app.api.routes_source_auth import router as source_auth_router
+from app.api.routes_reports import router as reports_router, source_connections_router
+from app.api.routes_role_profile import router as role_profile_router
 
 import app.models  # noqa: F401 — ensure all models registered
 
@@ -46,6 +49,10 @@ app.add_middleware(
 
 app.include_router(feed_router)
 app.include_router(company_profile_router)
+app.include_router(source_auth_router)
+app.include_router(reports_router)
+app.include_router(source_connections_router)
+app.include_router(role_profile_router)
 
 
 @app.get("/health")

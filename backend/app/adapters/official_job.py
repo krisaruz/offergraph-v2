@@ -113,7 +113,8 @@ class OfficialJobAdapter(SourceAdapter):
                 reason="Disabled in settings",
                 duration_ms=0.0,
             )
-        if settings.search_api_provider != "searxng":
+        provider_was_explicit = "search_api_provider" in settings.model_fields_set
+        if provider_was_explicit and settings.search_api_provider != "searxng":
             return SourceSearchResult(
                 source=self.id,
                 status=SourceStatus.CONFIG_ERROR,

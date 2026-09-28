@@ -1,8 +1,8 @@
 # PRD：OfferGraph / 面经雷达
 
-> 文档版本：2.3  
+> 文档版本：3.0  
 > 状态：实施中  
-> 最后更新：2026-06-07  
+> 最后更新：2026-07-02  
 > 维护者：OfferGraph Team
 
 ---
@@ -1656,7 +1656,303 @@ REDIS_URL=redis://localhost:6379/0
 
 ---
 
-## 15. LLM 使用规范
+## 15. v3 主方向：目标公司/岗位面试情报雷达
+
+### 15.1 定位调整
+
+OfferGraph 第一版主体验从“画像驱动 Feed”收敛为“目标公司/岗位面试情报雷达”。
+
+新的核心闭环：
+
+```text
+数据源连接 → 目标查询台 → 报告生成进度 → 情报报告 → 证据详情
+```
+
+第一版不再把模拟面试、简历分析、多画像管理作为主链路。它们可以作为报告之后的后续能力，但不牵引 MVP 设计。
+
+一句话定位更新为：
+
+> 用户输入目标公司、岗位方向、经验阶段后，系统基于小红书、脉脉、牛客等关键源生成一份可信、近期、可追溯的面试情报报告。
+
+### 15.2 核心用户
+
+第一版只优先服务已有明确目标公司的技术岗求职者。
+
+典型输入：
+
+- 公司：字节跳动、美团、阿里、小红书等。
+- 岗位方向：后端开发、前端开发、AI 应用开发、算法工程师等。
+- 经验阶段：实习、校招、社招。
+
+第一版暂不优先服务：
+
+- 不知道投什么公司的探索型用户。
+- 泛职业规划用户。
+- 从零转行学习路径用户。
+- 以简历优化或模拟面试为主诉的用户。
+
+### 15.3 MVP 主流程
+
+```mermaid
+flowchart TD
+    Start(["打开 OfferGraph"]) --> CheckSources["检查关键源连接状态"]
+    CheckSources --> SourcesReady{"小红书 / 脉脉 / 牛客都 ready?"}
+    SourcesReady -- 否 --> ConnectWizard["数据源连接向导"]
+    ConnectWizard --> LoginSource["应用内隔离浏览器登录或刷新会话"]
+    LoginSource --> ValidateSource["轻量真实搜索验证"]
+    ValidateSource --> CheckSources
+    SourcesReady -- 是 --> TargetConsole["目标查询台"]
+    TargetConsole --> SubmitBrief["提交 TargetBrief"]
+    SubmitBrief --> ReportProgress["报告生成进度"]
+    ReportProgress --> FinalState{"报告终态"}
+    FinalState -- ready --> Report["正式情报报告"]
+    FinalState -- sample_insufficient --> Insufficient["样本不足报告"]
+    FinalState -- blocked_source_unready --> Diagnostic["可恢复诊断页"]
+    FinalState -- failed_runtime --> RuntimeError["系统错误页"]
+    Report --> EvidenceDetail["证据详情"]
+```
+
+目标查询台替代旧 Onboarding 作为主入口。
+
+必填输入：
+
+- 目标公司
+- 岗位方向
+- 经验阶段
+
+可选输入：
+
+- 地域
+- 时间窗口
+- 重点主题
+
+### 15.4 关键源规则
+
+MVP 关键源定义为：
+
+- 小红书
+- 脉脉
+- 牛客
+
+搜索引擎和公开网页是辅助源，可以补充证据，但不能替代关键源生成正式报告。
+
+关键源 ready 不能只检查“存在 Cookie”。必须满足：
+
+- 本地存在该源隔离会话状态或等价的本地授权状态。
+- 能完成一次低风险关键词的轻量真实搜索验证。
+- 能区分可用、未登录、会话过期、验证码/风控、限流、超时、解析异常、无结果。
+- 最近验证时间不超过 24 小时。
+- 报告生成前必须复验三大关键源。
+
+主连接方式应是应用内隔离浏览器会话；手动 Cookie 导入只作为高级备用入口。
+
+### 15.5 双门禁规则
+
+正式报告必须同时通过两道门禁：
+
+1. 关键源门禁：小红书、脉脉、牛客都 ready，并且本次都参与搜索。
+2. 样本门禁：至少 5 篇有效面经、至少 2 个关键平台有有效样本、至少 8 条真实问题证据。
+
+不满足时：
+
+- 关键源失败：进入 `blocked_source_unready`，不生成正式报告。
+- 样本不足：进入 `sample_insufficient`，展示已有证据和补充建议，但不输出确定性趋势或准备结论。
+
+### 15.6 报告状态机
+
+```mermaid
+stateDiagram-v2
+    [*] --> validating_sources
+    validating_sources --> blocked_source_unready: 关键源未 ready 或本次失败
+    validating_sources --> searching: 三大关键源 ready
+    searching --> extracting: 搜索完成
+    extracting --> clustering: 有效问题抽取完成
+    clustering --> sample_insufficient: 样本未达阈值
+    clustering --> composing: 样本达阈值
+    composing --> ready: 报告生成成功
+    searching --> failed_runtime: 系统异常
+    extracting --> failed_runtime: LLM / DB / 抽取异常
+    composing --> failed_runtime: 生成异常
+    validating_sources --> cancelled: 用户取消
+    searching --> cancelled: 用户取消
+    extracting --> cancelled: 用户取消
+    composing --> cancelled: 用户取消
+```
+
+终态定义：
+
+- `ready`：正式报告可展示。
+- `sample_insufficient`：关键源成功，但样本不足。
+- `blocked_source_unready`：关键源未 ready 或本次失败。
+- `failed_runtime`：系统错误。
+- `cancelled`：用户取消或新查询覆盖旧查询。
+
+### 15.7 情报报告内容
+
+正式报告至少包含四层：
+
+1. 雷达摘要：样本数量、关键源参与情况、时间窗口、可靠性提示。
+2. 高频问题簇：按主题聚类的真实问题。
+3. 近期真实面经：作为证据列表展示来源、时间、匹配度、题目数。
+4. 准备建议：AI 基于证据簇生成，不新增事实。
+
+事实层规则：
+
+- `real_interview` 问题必须来自原文。
+- `real_interview` 问题必须有 `evidence_quote` 和来源 URL。
+- 高频/趋势问题簇至少需要 2 条真实问题或 2 个来源支撑。
+- 单来源问题只能标记为“单条样本”，不能标记为高频。
+
+建议层规则：
+
+- AI 建议必须关联至少一个 `QuestionCluster`。
+- AI 不得新增事实。
+- AI 不得把推断伪装成真实面经。
+- 样本不足时不输出确定性准备结论。
+
+### 15.8 核心数据模型
+
+新主模型围绕 `TargetBrief`、`EvidenceSource`、`InterviewQuestion`、`QuestionCluster`、`IntelligenceReport`、`ReportRun`。
+
+```typescript
+type TargetBrief = {
+  id: string;
+  company: string;
+  roleDirection: string;
+  experienceStage: "intern" | "campus" | "social";
+  region?: string | null;
+  timeWindowDays: number;
+  focusTopics: string[];
+};
+
+type ReportStatus =
+  | "ready"
+  | "sample_insufficient"
+  | "blocked_source_unready"
+  | "failed_runtime"
+  | "cancelled";
+
+type SourceHealth = {
+  source: "xiaohongshu" | "maimai" | "nowcoder";
+  status:
+    | "ready"
+    | "not_connected"
+    | "expired"
+    | "captcha_required"
+    | "rate_limited"
+    | "timeout"
+    | "parse_error"
+    | "disabled";
+  lastValidatedAt: string | null;
+  reason: string | null;
+  nextAction: "connect" | "relogin" | "retry" | "wait" | "inspect" | null;
+};
+
+type SampleQuality = {
+  validInterviewCount: number;
+  participatingKeySourceCount: number;
+  evidenceQuestionCount: number;
+  meetsFormalReportThreshold: boolean;
+  reason: string | null;
+};
+
+type ReportRun = {
+  id: string;
+  targetBrief: TargetBrief;
+  status: ReportStatus;
+  reportVersion: string;
+  sourceHealthSnapshot: SourceHealth[];
+  sampleQuality: SampleQuality;
+  createdAt: string;
+  completedAt?: string | null;
+};
+```
+
+### 15.9 后端模块架构
+
+```mermaid
+flowchart TD
+    Frontend["连接向导 / 目标查询台 / 报告页"] --> ReportAPI["Report API"]
+    ReportAPI --> ReportRuntime["ReportRuntime"]
+    ReportRuntime --> SourceConn["SourceConnectionManager"]
+    SourceConn --> ReportGate["ReportGate"]
+    ReportGate --> GateDecision{"关键源 ready?"}
+    GateDecision -- 否 --> Diagnostic["SourceDiagnostic"]
+    GateDecision -- 是 --> QueryPlanner["QueryPlanner"]
+    QueryPlanner --> Adapters["SourceAdapters"]
+    Adapters --> ExtractTool["ExtractInterviewTool"]
+    ExtractTool --> EvidenceGraph["EvidenceGraph Builder"]
+    EvidenceGraph --> Clusterer["QuestionClusterer"]
+    Clusterer --> Composer["ReportComposer"]
+    Composer --> ReportStore["ReportRun Store"]
+    ReportStore --> ReportAPI
+```
+
+模块职责：
+
+- `SourceConnectionManager`：管理三大关键源连接状态、健康检查、24h 复验、报告前复验。
+- `SourceConnection`：每个关键源一个实现，负责隔离会话、轻量搜索验证、失败类型标准化。
+- `SourceAdapter`：只负责搜索和解析，可以使用 ready 的 `SourceSessionContext`。
+- `ReportGate`：报告前置门禁，输出 `blocked_source_unready` 诊断信息。
+- `ReportRuntime`：新主编排模块，输入 `TargetBrief`，输出报告事件和最终 `ReportRun`。
+- `QuestionClusterer`：将真实问题聚类为问题簇。
+- `ReportComposer`：生成摘要和准备建议，且建议只能基于证据簇。
+
+报告链路并行新增，不直接删除旧 Feed 链路。`/api/feed/search` 和 `/api/feed/search/stream` 保留为底层能力、旧入口或证据列表来源。
+
+### 15.10 报告持久化与复用
+
+每次报告生成一个可复查的 `ReportRun`。
+
+长期保存：
+
+- `TargetBrief`
+- 报告状态
+- 源健康快照
+- 样本质量
+- 问题簇
+- 真实问题
+- 证据引用
+- 来源 URL、发布时间、平台、置信度
+
+短期保存：
+
+- 原始抓取正文，建议 TTL 7 天。
+
+永不保存：
+
+- Cookie
+- 请求头
+- 私有页面完整 HTML
+- 用户登录态信息
+
+同一 `TargetBrief` 24 小时内已有 `ready` 报告时，默认展示最近报告；用户点击“重新扫描”时创建新的 `ReportRun`，不覆盖旧报告。
+
+### 15.11 安全与隐私影响
+
+- 不读取用户系统浏览器资料。
+- 不做云端账号池。
+- 不托管平台账号。
+- Cookie/session 只本地保存。
+- 凭证不进入业务数据库、日志、测试快照或报告导出。
+- `tool_runs` 只能记录源名、状态、耗时、失败类型，不能记录敏感请求头或 Cookie。
+
+### 15.12 v3 验收标准
+
+- 首次主体验先检查关键源状态，三源未 ready 时进入连接/诊断体验。
+- 三源 ready 后展示目标查询台。
+- 目标查询台以公司、岗位方向、经验阶段作为必填输入。
+- 报告生成过程展示报告进度，而不是实时 Feed 卡片流。
+- 关键源失败时展示可恢复诊断页，不生成正式报告。
+- 样本不足时展示 `sample_insufficient`，不输出确定性趋势或准备建议。
+- 正式报告包含雷达摘要、问题簇、近期来源、准备建议。
+- 每个真实问题都有来源 URL 和证据引用。
+- AI 建议必须绑定问题簇，不能新增事实。
+- 旧 Feed API 和旧入口在迁移期不被删除。
+
+---
+
+## 16. LLM 使用规范
 
 系统中 LLM 用于：
 1. 面经正文结构化提取（问题、标签、难度）。
@@ -1679,6 +1975,7 @@ LLM 不得：
 
 | 日期 | 版本 | 变更内容 |
 |------|------|---------|
+| 2026-07-02 | 3.0 | 主方向重构为“目标公司/岗位面试情报雷达”：新增 v3 主流程（数据源连接 → 目标查询台 → 报告生成进度 → 情报报告 → 证据详情）、三大关键源（小红书/脉脉/牛客）双门禁规则、报告状态机、TargetBrief/ReportRun 数据模型、SourceConnection/ReportRuntime 模块边界、安全与隐私约束、v3 验收标准；保留旧 Feed 链路作为迁移期能力 |
 | 2026-06-08 | 2.6 | 前端全量优化 — Radar Intelligence 视觉方向：(1) 首页重写，去掉 AI SaaS 模板感，改为雷达扫描风格；(2) Feed 卡片从网格改为列表项风格，信息密度更高；(3) ActivityLog 改为 console/terminal 风格；(4) 全局色彩从 emerald 改为 cyan 色系；(5) 新增 radar-grid 背景、radar-sweep/scan-line 动画；(6) TrustBadge 改为色条风格 |
 | 2026-06-08 | 2.5 | LLM 抽取并行化：AgentRuntime._safe_batch_extract 和 _batch_extract 从串行 for 循环改为 asyncio.gather 并行执行，每篇文档使用独立 db session 避免 SQLite 锁竞争；更新 9.3 节调用链和 10.1 节时序图 |
 | 2026-06-07 | 2.4 | 排序优化 - 硬性时间过滤：(1) 新增 max_content_age_days 配置（默认 180 天），超过此天数的内容在排序前直接过滤；(2) 调整时间衰减曲线，1 年内 0.15、1-2 年 0.05、超 2 年 0.01；(3) 无法判断时间的内容保留（降级处理）；(4) 更新 9.4 节 TrustScore 算法说明 |

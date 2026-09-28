@@ -8,7 +8,13 @@ from typing import Any, Dict, List, Optional
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.adapters.base import SourceAdapter, SourceQuery, SourceSearchResult
+from app.adapters.base import (
+    SourceAdapter,
+    SourceQuery,
+    SourceSearchItem,
+    SourceSearchResult,
+    SourceStatus,
+)
 from app.config import settings
 from app.models.source_document import SourceDocumentModel
 from app.runtime.hook_engine import HookEngine, HookType, create_default_hook_engine
@@ -16,6 +22,7 @@ from app.runtime.permission_guard import PermissionGuard
 from app.runtime.query_planner import QueryPlanner, QueryPlan
 from app.runtime.ranker import Ranker
 from app.runtime.session_manager import SessionManager
+from app.runtime.source_health import SourceHealthRegistry
 from app.runtime.tool_registry import ToolRegistry
 from app.runtime.trace_logger import TraceLogger
 
@@ -36,6 +43,7 @@ class AgentRuntime:
         tool_registry: Optional[ToolRegistry] = None,
         permission_guard: Optional[PermissionGuard] = None,
         hook_engine: Optional[HookEngine] = None,
+        source_health_registry: Optional[SourceHealthRegistry] = None,
     ):
         self._db = db
         self._adapters = adapters
@@ -46,6 +54,7 @@ class AgentRuntime:
         self._session_manager = SessionManager(db)
         self._trace = TraceLogger(db)
         self._ranker = Ranker()
+        self._source_health = source_health_registry or SourceHealthRegistry()
 
     async def run_search(self, profile: dict) -> Dict[str, Any]:
         """
@@ -156,15 +165,16 @@ class AgentRuntime:
                 u = item.get("source_url", "")
                 url_counts[u] = url_counts.get(u, 0) + 1
 
-            ranked_results = self._ranker.rank(deduped_results, url_counts, profile=profile)
-            ranked_results = ranked_results[:settings.ranking_top_n]
+            ranked_results_all = self._ranker.rank(deduped_results, url_counts, profile=profile)
+            expired_filtered_count = max(len(deduped_results) - len(ranked_results_all), 0)
+            ranked_results = ranked_results_all[:settings.ranking_top_n]
 
             # 8. 更新 session 状态
             duration_ms = self._elapsed_ms(start_time)
             total_count = len(ranked_results)
 
-            has_success = any(s == "ok" for s in source_status.values())
-            has_failure = any(s != "ok" for s in source_status.values())
+            has_success = any(self._is_source_ok(s) for s in source_status.values())
+            has_failure = any(not self._is_source_ok(s) for s in source_status.values())
 
             if not has_success:
                 await self._session_manager.mark_failed(
@@ -209,6 +219,7 @@ class AgentRuntime:
                     "duplicateCount": len(all_results) - len(deduped_results),
                     "hookWarnings": hook_result.warnings,
                     "fetchedCount": len(fetched_doc_ids),
+                    "expiredFilteredCount": expired_filtered_count,
                 },
             }
 
@@ -239,6 +250,11 @@ class AgentRuntime:
         max_queries_per_source = 2
 
         try:
+            cooldown_status = self._source_health.cooldown_status(adapter_id)
+            if cooldown_status:
+                source_status[adapter_id] = cooldown_status
+                return []
+
             queries_to_run = query_plan.queries[:max_queries_per_source]
 
             async def _run_one_query(planned_query):
@@ -258,11 +274,32 @@ class AgentRuntime:
             query_tasks = [_run_one_query(q) for q in queries_to_run]
             query_results = await asyncio.gather(*query_tasks, return_exceptions=True)
 
+            had_source_failure = False
             for qr in query_results:
                 if isinstance(qr, Exception):
                     logger.warning(f"Query failed for {adapter_id}: {qr}")
+                    had_source_failure = True
                     continue
-                for sr in qr:
+                if isinstance(qr, SourceSearchResult):
+                    if qr.status not in {SourceStatus.OK, SourceStatus.EMPTY}:
+                        if not had_source_failure:
+                            source_status[adapter_id] = self._source_health.record_status(
+                                adapter_id,
+                                qr.status,
+                                qr.reason,
+                            )
+                        had_source_failure = True
+                        continue
+                    search_items = qr.normalized_items()
+                else:
+                    search_items = []
+                    for entry in qr:
+                        if isinstance(entry, SourceSearchItem):
+                            search_items.append(entry)
+                        elif isinstance(entry, SourceSearchResult):
+                            search_items.extend(entry.normalized_items())
+
+                for sr in search_items:
                     results.append({
                         "source": sr.source,
                         "source_url": sr.source_url,
@@ -271,7 +308,8 @@ class AgentRuntime:
                         "published_at": sr.published_at,
                     })
 
-            source_status[adapter_id] = "ok"
+            if not had_source_failure:
+                source_status[adapter_id] = "ok"
             ended_at = datetime.utcnow()
             duration_ms = int((ended_at - started_at).total_seconds() * 1000)
 
@@ -288,7 +326,11 @@ class AgentRuntime:
             )
 
         except asyncio.TimeoutError:
-            source_status[adapter_id] = "timeout"
+            source_status[adapter_id] = self._source_health.record_status(
+                adapter_id,
+                SourceStatus.TIMEOUT,
+                f"Timeout after {timeout}s",
+            )
             ended_at = datetime.utcnow()
             duration_ms = int((ended_at - started_at).total_seconds() * 1000)
 
@@ -305,7 +347,11 @@ class AgentRuntime:
             )
 
         except Exception as e:
-            source_status[adapter_id] = f"error:{type(e).__name__}"
+            source_status[adapter_id] = self._source_health.record_status(
+                adapter_id,
+                SourceStatus.ERROR,
+                str(e),
+            )
             ended_at = datetime.utcnow()
             duration_ms = int((ended_at - started_at).total_seconds() * 1000)
 
@@ -508,6 +554,12 @@ class AgentRuntime:
 
     def _elapsed_ms(self, start_time: float) -> int:
         return int((time.time() - start_time) * 1000)
+
+    @staticmethod
+    def _is_source_ok(status) -> bool:
+        if isinstance(status, dict):
+            return status.get("status") in {SourceStatus.OK.value, SourceStatus.EMPTY.value}
+        return status == "ok"
 
     def _build_error_response(self, session_id: str, error: Optional[str]) -> Dict[str, Any]:
         return {

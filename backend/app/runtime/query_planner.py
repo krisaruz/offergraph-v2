@@ -56,7 +56,7 @@ class QueryPlanner:
 
         candidate_label = _IDENTITY_MAP.get(identity, "")
         region_str = regions[0] if regions else None
-        current_year = str(datetime.utcnow().year)
+        current_year = str(datetime.utcnow().year - 1)
 
         queries: List[PlannedQuery] = []
         priority = 0

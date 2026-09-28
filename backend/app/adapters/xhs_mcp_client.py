@@ -17,6 +17,9 @@ from mcp.client.stdio import stdio_client
 
 logger = logging.getLogger(__name__)
 
+_MAX_CONCURRENT_CALLS = 3
+_MAX_HEALTH_FAILURES = 3
+
 # MCP Server Python 入口所在目录（npm global 安装路径）
 _DEFAULT_MCP_ROOT = os.path.join(
     os.environ.get("APPDATA", ""),
@@ -35,12 +38,20 @@ class XhsMcpClient:
         self._session: Optional[ClientSession] = None
         self._exit_stack: Optional[AsyncExitStack] = None
         self._connected = False
+        self._healthy = True
+        self._health_failures = 0
+        self._heartbeat_task: Optional[asyncio.Task] = None
+        self._call_semaphore = asyncio.Semaphore(_MAX_CONCURRENT_CALLS)
         self._connect_lock = asyncio.Lock()
 
     @classmethod
     async def get_instance(cls, command: str = "") -> "XhsMcpClient":
         """获取或创建单例实例"""
         async with cls._lock:
+            requested_root = command or _DEFAULT_MCP_ROOT
+            if cls._instance is not None and cls._instance._mcp_root != requested_root:
+                await cls._instance.disconnect()
+                cls._instance = None
             if cls._instance is None:
                 cls._instance = cls(mcp_root=command)
             return cls._instance
@@ -100,6 +111,8 @@ class XhsMcpClient:
             logger.info(f"XHS MCP connected, available tools: {tool_names}")
 
             self._connected = True
+            self._healthy = True
+            self._health_failures = 0
             return True
 
         except asyncio.TimeoutError:
@@ -132,21 +145,32 @@ class XhsMcpClient:
             return None
 
         try:
-            result = await asyncio.wait_for(
-                self._session.call_tool(name, arguments=arguments),
-                timeout=timeout,
-            )
+            async with self._call_semaphore:
+                result = await asyncio.wait_for(
+                    self._session.call_tool(name, arguments=arguments),
+                    timeout=timeout,
+                )
+            self._record_call_success()
             if result.content:
                 return result.content[0].text
             return None
         except asyncio.TimeoutError:
             logger.error(f"XHS MCP call_tool({name}) timed out after {timeout}s")
-            self._connected = False
+            self._record_call_failure()
             return None
         except Exception as e:
             logger.error(f"XHS MCP call_tool({name}) failed: {e}")
-            self._connected = False
+            self._record_call_failure()
             return None
+
+    def _record_call_success(self) -> None:
+        self._health_failures = 0
+        self._healthy = True
+
+    def _record_call_failure(self) -> None:
+        self._health_failures += 1
+        if self._health_failures >= _MAX_HEALTH_FAILURES:
+            self._healthy = False
 
     async def search_notes(
         self, keywords: str, limit: int = 5
@@ -179,7 +203,22 @@ class XhsMcpClient:
         if not text:
             return None
 
+        if self._looks_auth_required(text):
+            raise ValueError("auth_required")
+
         return self._parse_note_content(text)
+
+    @staticmethod
+    def _looks_auth_required(text: str) -> bool:
+        lowered = text.lower()
+        auth_markers = (
+            "请先登录",
+            "需要登录",
+            "登录后",
+            "login required",
+            "auth_required",
+        )
+        return any(marker in lowered for marker in auth_markers)
 
     @staticmethod
     def _parse_search_results(text: str) -> List[dict]:

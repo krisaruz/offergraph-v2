@@ -106,6 +106,7 @@ async def extract_interview(
 
     total_questions = 0
     total_with_evidence = 0
+    representative_questions = []
 
     for event_data in events:
         event_id = str(uuid.uuid4())
@@ -161,6 +162,14 @@ async def extract_interview(
                 db.add(evidence)
                 event_evidence_count += 1
                 total_with_evidence += 1
+                if len(representative_questions) < 5:
+                    representative_questions.append({
+                        "text": q_data.get("text", ""),
+                        "category": q_data.get("category", "other"),
+                        "evidence_quote": evidence_quote,
+                        "source_type": source_type,
+                        "confidence": q_data.get("confidence", 0.0),
+                    })
 
         real_count = sum(1 for q in questions if q.get("source_type") == "real_interview")
         coverage = event_evidence_count / real_count if real_count > 0 else 0.0
@@ -177,6 +186,7 @@ async def extract_interview(
         "question_count": total_questions,
         "evidence_count": total_with_evidence,
         "confidence": overall_confidence,
+        "representative_questions": representative_questions,
     }
 
 
@@ -235,6 +245,7 @@ async def extract_interview_streaming(
 
     total_questions = 0
     total_with_evidence = 0
+    representative_questions = []
 
     for event_data in events:
         event_id = str(uuid.uuid4())
@@ -289,6 +300,14 @@ async def extract_interview_streaming(
                 db.add(evidence)
                 event_evidence_count += 1
                 total_with_evidence += 1
+                if len(representative_questions) < 5:
+                    representative_questions.append({
+                        "text": q_data.get("text", ""),
+                        "category": q_data.get("category", "other"),
+                        "evidence_quote": evidence_quote,
+                        "source_type": source_type,
+                        "confidence": q_data.get("confidence", 0.0),
+                    })
 
         real_count = sum(1 for q in questions if q.get("source_type") == "real_interview")
         coverage = event_evidence_count / real_count if real_count > 0 else 0.0
@@ -317,6 +336,7 @@ async def extract_interview_streaming(
         "evidence_count": total_with_evidence,
         "confidence": overall_confidence,
         "summary": f"提取了 {total_questions} 个面试问题，涵盖{category_summary}",
+        "representative_questions": representative_questions,
     }
 
 
